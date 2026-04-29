@@ -1,0 +1,13 @@
+datasets
+pandas
+scikit-learn
+sentence-transformers
+shap
+fairlearn
+streamlit
+pdfplumber
+joblib
+matplotlib
+seaborn
+notebook
+ipykernel
