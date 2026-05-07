@@ -50,32 +50,78 @@ def predict_candidates(model, le, X):
 
 
 # ──────────────────────────────────────────────────
-# 3. COMPUTE FINAL SCORE
+# 3. COMPUTE FINAL SCORE  (FIXED)
 # ──────────────────────────────────────────────────
 
-def compute_final_score(confidence, bert_sim, cosine_sim):
+def compute_final_score(confidence, bert_sim, cosine_sim, label):
     """
     Weighted final score combining:
-    - 50% model confidence
-    - 30% BERT semantic similarity
-    - 20% TF-IDF cosine similarity
+    - 55% BERT semantic similarity  (most important — captures true relevance)
+    - 30% TF-IDF cosine similarity  (keyword overlap)
+    - 15% model confidence          (only rewarded for Good/Potential Fit)
+
+    Key fix: confidence for a 'No Fit' prediction is NOT rewarded.
+    Previously, high confidence in 'No Fit' was inflating scores
+    for irrelevant candidates (e.g. DevOps ranked above Data Scientist).
     """
-    return (0.5 * confidence +
-            0.3 * bert_sim +
-            0.2 * cosine_sim)
+    label_bonus = {
+        'Good Fit':      1.0,
+        'Potential Fit': 0.6,
+        'No Fit':        0.0   # don't reward confidence in No Fit
+    }
+    adjusted_confidence = confidence * label_bonus.get(label, 0.0)
+
+    return (0.55 * bert_sim +
+            0.30 * cosine_sim +
+            0.15 * adjusted_confidence)
 
 
 # ──────────────────────────────────────────────────
-# 4. ASSIGN TIER
+# 3b. FIX PREDICTED LABEL (NEW)
 # ──────────────────────────────────────────────────
 
-def assign_tier(label):
+def fix_predicted_label(label, bert_sim, cosine_sim):
     """
-    Assign numeric tier for sorting:
-    Good Fit = 1, Potential Fit = 2, No Fit = 3
+    Override XGBoost label when similarity scores
+    clearly contradict the prediction.
+
+    Thresholds (tunable):
+      bert_sim >= 0.65  AND  cosine_sim >= 0.35  → Good Fit
+      bert_sim >= 0.55  AND  cosine_sim >= 0.10  → Potential Fit
+      Otherwise keep original label
+    
+    Why: XGBoost was trained on limited data and mis-classifies
+    candidates when the JD is outside its training distribution.
+    BERT + TF-IDF cosine similarity are more reliable signals
+    for unseen JDs.
     """
-    tiers = {'Good Fit': 1, 'Potential Fit': 2, 'No Fit': 3}
-    return tiers.get(label, 3)
+    if bert_sim >= 0.65 and cosine_sim >= 0.35:
+        return 'Good Fit'
+    if bert_sim >= 0.55 and cosine_sim >= 0.10:
+        return 'Potential Fit'
+    return label
+
+
+# ──────────────────────────────────────────────────
+# 4. ASSIGN TIER  (FIXED)
+# ──────────────────────────────────────────────────
+
+def assign_tier(label, final_score=None):
+    """
+    Tier is now a display hint only — NOT used as primary sort key.
+
+    Fix: If model says 'No Fit' but similarity score is high (>=0.45),
+    candidate is bumped to tier 2 (Potential Fit zone).
+    This handles cases where XGBoost mis-classifies a relevant candidate.
+    """
+    if label == 'Good Fit':
+        return 1
+    if label == 'Potential Fit':
+        return 2
+    # No Fit — override if similarity is actually high
+    if final_score is not None and final_score >= 0.45:
+        return 2
+    return 3
 
 
 # ──────────────────────────────────────────────────
@@ -93,18 +139,26 @@ def rank_candidates_from_df(model, le, X_test, df_test):
     df_ranking['predicted_label'] = labels
     df_ranking['confidence']      = confidence
 
-    df_ranking['final_score'] = compute_final_score(
-        df_ranking['confidence'],
-        df_ranking['bert_similarity'],
-        df_ranking['cosine_similarity']
+    df_ranking['final_score'] = df_ranking.apply(
+        lambda row: compute_final_score(
+            row['confidence'],
+            row['bert_similarity'],
+            row['cosine_similarity'],
+            row['predicted_label']
+        ), axis=1
     )
 
-    df_ranking['tier'] = df_ranking['predicted_label'].apply(
-        assign_tier)
+    df_ranking['tier'] = df_ranking.apply(
+        lambda row: assign_tier(
+            row['predicted_label'],
+            row['final_score']
+        ), axis=1
+    )
 
+    # Sort purely by final_score — tier is display only
     df_ranking = df_ranking.sort_values(
-        ['tier', 'final_score'],
-        ascending=[True, False]
+        'final_score',
+        ascending=False
     ).reset_index(drop=True)
 
     df_ranking['rank'] = df_ranking.index + 1
@@ -165,25 +219,28 @@ def rank_live_candidates(resumes, jd_text,
         label      = le.inverse_transform(y_pred)[0]
         confidence = float(proba.max())
 
-        # Final score
+        # Override label if similarity scores contradict XGBoost
+        label = fix_predicted_label(label, bert_sim, cosine_sim)
+
+        # Final score — label passed so No Fit confidence is not rewarded
         final_score = compute_final_score(
-            confidence, bert_sim, cosine_sim)
+            confidence, bert_sim, cosine_sim, label)
 
         results.append({
-            'candidate':       name,
-            'predicted_label': label,
-            'confidence':      round(confidence * 100, 1),
-            'bert_similarity': round(bert_sim, 4),
+            'candidate':         name,
+            'predicted_label':   label,
+            'confidence':        round(confidence * 100, 1),
+            'bert_similarity':   round(bert_sim, 4),
             'cosine_similarity': round(cosine_sim, 4),
-            'final_score':     round(final_score, 4),
-            'tier':            assign_tier(label)
+            'final_score':       round(final_score, 4),
+            'tier':              assign_tier(label, final_score)
         })
 
-    # Sort by tier then final score
+    # Sort purely by final_score — tier is display hint only
     df_results = pd.DataFrame(results)
     df_results = df_results.sort_values(
-        ['tier', 'final_score'],
-        ascending=[True, False]
+        'final_score',
+        ascending=False
     ).reset_index(drop=True)
 
     df_results['rank'] = df_results.index + 1
