@@ -88,18 +88,22 @@ def fix_predicted_label(label, bert_sim, cosine_sim):
     Thresholds (tunable):
       bert_sim >= 0.65  AND  cosine_sim >= 0.35  → Good Fit
       bert_sim >= 0.55  AND  cosine_sim >= 0.10  → Potential Fit
-      Otherwise keep original label
-    
+      Anything else                               → No Fit
+
+    This also DOWNGRADES incorrect XGBoost Good Fit / Potential Fit
+    predictions — e.g. a Junior Dev labelled Good Fit for a Senior
+    Data Scientist JD will be corrected because cosine_sim will be low.
+
     Why: XGBoost was trained on limited data and mis-classifies
     candidates when the JD is outside its training distribution.
     BERT + TF-IDF cosine similarity are more reliable signals
-    for unseen JDs.
+    for unseen JDs, so we use them as the single source of truth.
     """
     if bert_sim >= 0.65 and cosine_sim >= 0.35:
         return 'Good Fit'
     if bert_sim >= 0.55 and cosine_sim >= 0.10:
         return 'Potential Fit'
-    return label
+    return 'No Fit'   # ← always override, not just upgrade
 
 
 # ──────────────────────────────────────────────────
