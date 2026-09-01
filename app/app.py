@@ -261,8 +261,8 @@ st.markdown('<div class="section-card">', unsafe_allow_html=True)
 st.header("📂 Step 2: Upload Candidate Resumes")
 
 uploaded_files = st.file_uploader(
-    "Upload Multiple Resume Files (.txt)",
-    type=["txt"],
+    "Upload Multiple Resume Files (.pdf, .docx, .txt)",
+    type=["txt", "pdf", "docx"],
     accept_multiple_files=True
 )
 
@@ -291,10 +291,9 @@ if rank_button:
     for file in uploaded_files:
 
         try:
-            resume_text = file.read().decode(
-                "latin-1",
-                errors="ignore"
-            )
+            from file_reader import extract_text
+
+            resume_text = extract_text(file)
 
             resumes.append({
                 "name": file.name,
