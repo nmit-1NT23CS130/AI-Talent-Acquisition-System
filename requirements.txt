@@ -11,3 +11,6 @@ matplotlib
 seaborn
 notebook
 ipykernel
+nltk
+xgboost
+python-docx
