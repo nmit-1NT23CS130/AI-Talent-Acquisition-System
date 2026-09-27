@@ -108,6 +108,16 @@ ranking_module = load_module(
     "06_ranking.py"
 )
 
+skill_gap_module = load_module(
+    "skill_gap_module",
+    "07_skill_gap.py"
+)
+
+explainability_module = load_module(
+    "explainability_module",
+    "08_explainability.py"
+)
+
 # ---------------------------------------------------
 # FUNCTIONS
 # ---------------------------------------------------
@@ -117,9 +127,10 @@ load_bert_model = semantic_matching.load_bert_model
 
 rank_live_candidates = ranking_module.rank_live_candidates
 
-# ---------------------------------------------------
-# LOAD MODELS
-# ---------------------------------------------------
+build_explainer = explainability_module.build_explainer
+explain_candidate = explainability_module.explain_candidate
+analyze_skill_gap = skill_gap_module.analyze_skill_gap
+
 # ---------------------------------------------------
 # LOAD MODELS
 # ---------------------------------------------------
@@ -152,10 +163,15 @@ def load_all_models():
     le = joblib.load(le_path)
     tfidf = joblib.load(tfidf_path)
 
-    return model, le, tfidf, bert_model
+    try:
+        explainer = build_explainer(model)
+    except Exception:
+        explainer = None
+
+    return model, le, tfidf, bert_model, explainer
 
 
-model, le, tfidf, bert_model = load_all_models()
+model, le, tfidf, bert_model, explainer = load_all_models()
 
 
 # ---------------------------------------------------
@@ -300,8 +316,12 @@ if rank_button:
                 "text": resume_text
             })
 
-        except:
-            st.warning(f"Could not process {file.name}")
+        except Exception as e:
+            st.warning(f"Could not process {file.name}: {e}")
+
+    if not resumes:
+        st.error("Could not extract text from any uploaded resume. Please check the files and try again.")
+        st.stop()
 
     with st.spinner("🤖 AI is analyzing resumes using TF-IDF + BERT + XGBoost..."):
 
@@ -314,7 +334,10 @@ if rank_button:
             le,
             tfidf,
             bert_model,
-            preprocess_text
+            preprocess_text,
+            explainer=explainer,
+            explain_fn=explain_candidate,
+            skill_gap_fn=analyze_skill_gap
         )
 
     # ---------------------------------------------------
@@ -325,7 +348,7 @@ if rank_button:
     st.header("📊 Ranked Candidates")
 
     st.dataframe(
-        df,
+        df.drop(columns=['explanation'], errors='ignore'),
         use_container_width=True
     )
 
@@ -360,34 +383,73 @@ Predicted Fit: {top_candidate['predicted_label']}
     top5 = df.head(5)
 
     st.dataframe(
-        top5,
+        top5.drop(columns=['explanation'], errors='ignore'),
         use_container_width=True
     )
 
     st.markdown('</div>', unsafe_allow_html=True)
-
     # ---------------------------------------------------
-    # WHY RANKED
+    # EXPLAINABLE AI
     # ---------------------------------------------------
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
 
-    st.header("🧠 Why Candidates Were Ranked")
+    st.header("🧩 Explainable AI — Why This Candidate?")
+
+    def _label(skill):
+        """Skill list entries may be plain strings or dicts like
+        {'skill': 'Python', 'status': 'Matched', ...} — always show
+        just the readable skill name."""
+        return skill['skill'] if isinstance(skill, dict) else skill
 
     for _, row in top5.iterrows():
+        explanation = row.get('explanation')
+        with st.expander(f"Explain: {row['candidate']} — {row['predicted_label']}"):
+            if not explanation:
+                st.write("No explanation available for this candidate.")
+                continue
 
-        st.info(f"""
-Candidate: {row['candidate']}
+            semantic_note = explanation['semantic_note']
 
-✔ Final Score: {row['final_score']}
+            # One clean category — no "model said X but changed to Y"
+            # messaging, and no raw BERT/TF-IDF decimal values shown.
+            st.markdown(f"**Category:** {row['predicted_label']}")
+            st.markdown(f"**Overall Match:** {semantic_note['reading']}")
 
-✔ Predicted Fit: {row['predicted_label']}
+            skill_gap = explanation.get('skill_gap')
 
-✔ Confidence: {row['confidence']}%
+            st.markdown("#### 🎯 Skill Gap Analysis")
 
-✔ BERT Similarity: {row['bert_similarity']}
+            gcol1, gcol2 = st.columns(2)
+            with gcol1:
+                st.markdown("✅ **Matched Required Skills**")
+                if skill_gap and skill_gap['matched_required']:
+                    for skill in skill_gap['matched_required']:
+                        st.write(f"- {_label(skill)}")
+                else:
+                    st.write("None")
+            with gcol2:
+                st.markdown("⚠️ **Missing Required Skills**")
+                if skill_gap and skill_gap['missing_required']:
+                    for skill in skill_gap['missing_required']:
+                        st.write(f"- {_label(skill)}")
+                else:
+                    st.write("None")
 
-✔ TF-IDF Cosine Similarity: {row['cosine_similarity']}
-""")
+            gcol3, gcol4 = st.columns(2)
+            with gcol3:
+                st.markdown("✅ **Matched Nice-to-Have**")
+                if skill_gap and skill_gap['matched_nice_to_have']:
+                    for skill in skill_gap['matched_nice_to_have']:
+                        st.write(f"- {_label(skill)}")
+                else:
+                    st.write("None")
+            with gcol4:
+                st.markdown("💡 **Missing Nice-to-Have**")
+                if skill_gap and skill_gap['missing_nice_to_have']:
+                    for skill in skill_gap['missing_nice_to_have']:
+                        st.write(f"- {_label(skill)}")
+                else:
+                    st.write("None")
 
     st.markdown('</div>', unsafe_allow_html=True)
 

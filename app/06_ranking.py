@@ -90,10 +90,6 @@ def fix_predicted_label(label, bert_sim, cosine_sim):
       bert_sim >= 0.55  AND  cosine_sim >= 0.10  → Potential Fit
       Anything else                               → No Fit
 
-    This also DOWNGRADES incorrect XGBoost Good Fit / Potential Fit
-    predictions — e.g. a Junior Dev labelled Good Fit for a Senior
-    Data Scientist JD will be corrected because cosine_sim will be low.
-
     Why: XGBoost was trained on limited data and mis-classifies
     candidates when the JD is outside its training distribution.
     BERT + TF-IDF cosine similarity are more reliable signals
@@ -116,13 +112,11 @@ def assign_tier(label, final_score=None):
 
     Fix: If model says 'No Fit' but similarity score is high (>=0.45),
     candidate is bumped to tier 2 (Potential Fit zone).
-    This handles cases where XGBoost mis-classifies a relevant candidate.
     """
     if label == 'Good Fit':
         return 1
     if label == 'Potential Fit':
         return 2
-    # No Fit — override if similarity is actually high
     if final_score is not None and final_score >= 0.45:
         return 2
     return 3
@@ -159,7 +153,6 @@ def rank_candidates_from_df(model, le, X_test, df_test):
         ), axis=1
     )
 
-    # Sort purely by final_score — tier is display only
     df_ranking = df_ranking.sort_values(
         'final_score',
         ascending=False
@@ -176,7 +169,9 @@ def rank_candidates_from_df(model, le, X_test, df_test):
 
 def rank_live_candidates(resumes, jd_text,
                           model, le, tfidf, bert_model,
-                          preprocess_fn):
+                          preprocess_fn,
+                          explainer=None, explain_fn=None,
+                          skill_gap_fn=None):
     """
     Rank a list of live uploaded resumes against a JD.
 
@@ -188,11 +183,21 @@ def rank_live_candidates(resumes, jd_text,
         tfidf        : fitted TF-IDF vectorizer
         bert_model   : loaded Sentence-BERT model
         preprocess_fn: function to clean raw text
+        explainer    : optional shap explainer from
+                       08_explainability.build_explainer(model)
+        explain_fn   : optional 08_explainability.explain_candidate
+                       function
+        skill_gap_fn : optional 07_skill_gap.analyze_skill_gap function
 
     Returns: sorted DataFrame with ranking results
     """
     jd_clean = preprocess_fn(jd_text)
     results  = []
+
+    # JD doesn't change across resumes — encode it once instead of
+    # redoing this (expensive, especially the BERT call) per resume.
+    j_vec = tfidf.transform([jd_clean])
+    j_emb = bert_model.encode([jd_clean])
 
     for resume in resumes:
         name         = resume['name']
@@ -200,14 +205,12 @@ def rank_live_candidates(resumes, jd_text,
 
         # TF-IDF features
         r_vec      = tfidf.transform([resume_clean])
-        j_vec      = tfidf.transform([jd_clean])
         cosine_sim = float(cosine_similarity(r_vec, j_vec)[0][0])
         sim_sparse = sp.csr_matrix([[cosine_sim]])
         X_tfidf    = sp.hstack([r_vec, j_vec, sim_sparse])
 
         # BERT features
         r_emb     = bert_model.encode([resume_clean])
-        j_emb     = bert_model.encode([jd_clean])
         bert_sim  = float(cosine_similarity(r_emb, j_emb)[0][0])
 
         # Combine TF-IDF + BERT
@@ -223,6 +226,9 @@ def rank_live_candidates(resumes, jd_text,
         label      = le.inverse_transform(y_pred)[0]
         confidence = float(proba.max())
 
+        # Keep the raw XGBoost label before any override, for explainability
+        raw_label = label
+
         # Override label if similarity scores contradict XGBoost
         label = fix_predicted_label(label, bert_sim, cosine_sim)
 
@@ -230,15 +236,36 @@ def rank_live_candidates(resumes, jd_text,
         final_score = compute_final_score(
             confidence, bert_sim, cosine_sim, label)
 
-        results.append({
+        result_row = {
             'candidate':         name,
             'predicted_label':   label,
             'confidence':        round(confidence * 100, 1),
             'bert_similarity':   round(bert_sim, 4),
             'cosine_similarity': round(cosine_sim, 4),
             'final_score':       round(final_score, 4),
-            'tier':              assign_tier(label, final_score)
-        })
+            'tier':              assign_tier(label, final_score),
+        }
+
+        if explain_fn is not None:
+            result_row['explanation'] = explain_fn(
+                explainer, model, le, tfidf,
+                np.asarray(r_vec.todense()).ravel(),
+                np.asarray(j_vec.todense()).ravel(),
+                np.asarray(X_combined.todense()).ravel(),
+                raw_label, label, confidence, bert_sim, cosine_sim,
+                resume_text_raw=resume['text'],
+                jd_text_raw=jd_text,
+            )
+
+        if skill_gap_fn is not None:
+            skill_gap_result = skill_gap_fn(
+                jd_text, resume['text'], bert_model
+            )
+            if 'explanation' not in result_row:
+                result_row['explanation'] = {}
+            result_row['explanation']['skill_gap'] = skill_gap_result
+
+        results.append(result_row)
 
     # Sort purely by final_score — tier is display hint only
     df_results = pd.DataFrame(results)
