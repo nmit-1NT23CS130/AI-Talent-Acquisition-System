@@ -1,292 +1,683 @@
+
 """
-ranking.py
-==========
-Candidate ranking using trained model.
-Used by Streamlit frontend and notebooks.
+06_ranking_enhanced.py
+======================
+
+Candidate ranking using the combined trained model.
+Used by the Streamlit frontend.
+
+Combined model files:
+- best_model_combined.pkl
+- label_encoder_combined.pkl
+- tfidf_vectorizer_combined.pkl
+- bert_model_combined.pkl
 """
 
+import os
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
 import joblib
-
+import importlib.util
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-# ──────────────────────────────────────────────────
-# 1. LOAD MODEL AND DATA
-# ──────────────────────────────────────────────────
+def load_optional_module(filename):
+    module_path = os.path.join(
+        os.path.dirname(__file__),
+        filename
+    )
 
-def load_ranking_components(models_dir="../models",
-                             data_dir="../data"):
-    """Load model, label encoder and test features."""
-    best_model = joblib.load(f"{models_dir}/best_model.pkl")
-    le         = joblib.load(f"{models_dir}/label_encoder.pkl")
-    tfidf      = joblib.load(f"{models_dir}/tfidf_vectorizer.pkl")
-    X_test     = sp.load_npz(f"{data_dir}/X_test.npz")
-    df_test    = pd.read_csv(
-        f"{data_dir}/resume_jd_test_cleaned.csv")
+    spec = importlib.util.spec_from_file_location(
+        filename.replace(".py", ""),
+        module_path
+    )
 
-    print("✅ Ranking components loaded!")
-    return best_model, le, tfidf, X_test, df_test
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
 
 
-# ──────────────────────────────────────────────────
-# 2. PREDICT LABELS AND SCORES
-# ──────────────────────────────────────────────────
+_explainability_module = load_optional_module("08_explainability.py")
+_skill_gap_module = load_optional_module("07_skill_gap.py")
+
+build_explainer = _explainability_module.build_explainer
+explain_candidate = _explainability_module.explain_candidate
+analyze_skill_gap = _skill_gap_module.analyze_skill_gap
+
+
+# ============================================================
+# 1. LOAD COMBINED MODEL COMPONENTS
+# ============================================================
+
+def load_ranking_components():
+    """
+    Load the combined XGBoost model,
+    label encoder, TF-IDF vectorizer
+    and Sentence-BERT model.
+    """
+
+    # Project root = parent of app folder
+    base_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+    models_dir = os.path.join(
+        base_dir,
+        "models"
+    )
+
+    # Enhanced XGBoost model
+    best_model = joblib.load(
+        os.path.join(
+            models_dir,
+            "best_model_combined.pkl"
+        )
+    )
+
+    # Enhanced label encoder
+    le = joblib.load(
+        os.path.join(
+            models_dir,
+            "label_encoder_combined.pkl"
+        )
+    )
+
+    # Enhanced TF-IDF vectorizer
+    tfidf = joblib.load(
+        os.path.join(
+            models_dir,
+            "tfidf_vectorizer_combined.pkl"
+        )
+    )
+
+    # Enhanced Sentence-BERT model
+    bert_model = joblib.load(
+        os.path.join(
+            models_dir,
+            "bert_model_combined.pkl"
+        )
+    )
+
+    print("Combined ranking components loaded!")
+
+    return best_model, le, tfidf, bert_model
+
+
+# ============================================================
+# 2. PREPROCESS TEXT
+# ============================================================
+
+def preprocess_text(text):
+    """
+    Preprocessing used for the combined dataset.
+
+    - lowercase
+    - email removal
+    - URL removal
+    - phone number removal
+    - non-letter removal
+    - extra-space removal
+    """
+
+    import re
+
+    text = str(text).lower()
+
+    # Remove emails
+    text = re.sub(
+        r'\S+@\S+',
+        ' ',
+        text
+    )
+
+    # Remove URLs
+    text = re.sub(
+        r'http\S+|www\S+',
+        ' ',
+        text
+    )
+
+    # Remove phone numbers
+    text = re.sub(
+        r'\+?\d[\d\s\-().]{7,}\d',
+        ' ',
+        text
+    )
+
+    # Keep letters and spaces
+    text = re.sub(
+        r'[^a-zA-Z\s]',
+        ' ',
+        text
+    )
+
+    # Remove extra spaces
+    text = re.sub(
+        r'\s+',
+        ' ',
+        text
+    ).strip()
+
+    return text
+
+
+# ============================================================
+# 3. PREDICT LABELS AND CONFIDENCE
+# ============================================================
 
 def predict_candidates(model, le, X):
     """
-    Predict labels and confidence scores for candidates.
-    Returns predicted labels and confidence scores.
+    Predict labels and model confidence.
     """
-    y_pred = model.predict(X)
-    proba  = model.predict_proba(X)
 
-    labels     = le.inverse_transform(y_pred)
-    confidence = proba.max(axis=1)
+    y_pred = model.predict(X)
+
+    proba = model.predict_proba(X)
+
+    labels = le.inverse_transform(y_pred)
+
+    confidence = proba.max(
+        axis=1
+    )
 
     return labels, confidence
 
 
-# ──────────────────────────────────────────────────
-# 3. COMPUTE FINAL SCORE  (FIXED)
-# ──────────────────────────────────────────────────
+# ============================================================
+# 4. COMPUTE FINAL SCORE
+# ============================================================
 
-def compute_final_score(confidence, bert_sim, cosine_sim, label):
+def compute_final_score(
+    confidence,
+    bert_sim,
+    cosine_sim,
+    label
+):
     """
-    Weighted final score combining:
-    - 55% BERT semantic similarity  (most important — captures true relevance)
-    - 30% TF-IDF cosine similarity  (keyword overlap)
-    - 15% model confidence          (only rewarded for Good/Potential Fit)
+    Final ranking score:
 
-    Key fix: confidence for a 'No Fit' prediction is NOT rewarded.
-    Previously, high confidence in 'No Fit' was inflating scores
-    for irrelevant candidates (e.g. DevOps ranked above Data Scientist).
+    55% BERT semantic similarity
+    30% TF-IDF cosine similarity
+    15% model confidence
+
+    Confidence is only rewarded for:
+    Good Fit / Potential Fit.
+
+    No Fit confidence receives no bonus.
     """
+
     label_bonus = {
-        'Good Fit':      1.0,
-        'Potential Fit': 0.6,
-        'No Fit':        0.0   # don't reward confidence in No Fit
+        "Good Fit": 1.0,
+        "Potential Fit": 0.6,
+        "No Fit": 0.0
     }
-    adjusted_confidence = confidence * label_bonus.get(label, 0.0)
 
-    return (0.55 * bert_sim +
-            0.30 * cosine_sim +
-            0.15 * adjusted_confidence)
+    adjusted_confidence = (
+        confidence *
+        label_bonus.get(
+            label,
+            0.0
+        )
+    )
+
+    return (
+        0.55 * bert_sim +
+        0.30 * cosine_sim +
+        0.15 * adjusted_confidence
+    )
 
 
-# ──────────────────────────────────────────────────
-# 3b. FIX PREDICTED LABEL (NEW)
-# ──────────────────────────────────────────────────
+# ============================================================
+# 5. FIX PREDICTED LABEL
+# ============================================================
 
-def fix_predicted_label(label, bert_sim, cosine_sim):
+def fix_predicted_label(
+    label,
+    bert_sim,
+    cosine_sim
+):
     """
-    Override XGBoost label when similarity scores
-    clearly contradict the prediction.
+    Adjust the model prediction using similarity signals.
 
-    Thresholds (tunable):
-      bert_sim >= 0.65  AND  cosine_sim >= 0.35  → Good Fit
-      bert_sim >= 0.55  AND  cosine_sim >= 0.10  → Potential Fit
-      Anything else                               → No Fit
+    Good Fit:
+        BERT >= 0.65 AND TF-IDF >= 0.35
 
-    This also DOWNGRADES incorrect XGBoost Good Fit / Potential Fit
-    predictions — e.g. a Junior Dev labelled Good Fit for a Senior
-    Data Scientist JD will be corrected because cosine_sim will be low.
+    Potential Fit:
+        BERT >= 0.55 AND TF-IDF >= 0.10
 
-    Why: XGBoost was trained on limited data and mis-classifies
-    candidates when the JD is outside its training distribution.
-    BERT + TF-IDF cosine similarity are more reliable signals
-    for unseen JDs, so we use them as the single source of truth.
+    Otherwise:
+        No Fit
     """
-    if bert_sim >= 0.65 and cosine_sim >= 0.35:
-        return 'Good Fit'
-    if bert_sim >= 0.55 and cosine_sim >= 0.10:
-        return 'Potential Fit'
-    return 'No Fit'   # ← always override, not just upgrade
+
+    if (
+        bert_sim >= 0.65
+        and cosine_sim >= 0.35
+    ):
+        return "Good Fit"
+
+    if (
+        bert_sim >= 0.55
+        and cosine_sim >= 0.10
+    ):
+        return "Potential Fit"
+
+    return "No Fit"
 
 
-# ──────────────────────────────────────────────────
-# 4. ASSIGN TIER  (FIXED)
-# ──────────────────────────────────────────────────
+# ============================================================
+# 6. ASSIGN TIER
+# ============================================================
 
-def assign_tier(label, final_score=None):
+def assign_tier(
+    label,
+    final_score=None
+):
     """
-    Tier is now a display hint only — NOT used as primary sort key.
+    Tier is used only as a display hint.
 
-    Fix: If model says 'No Fit' but similarity score is high (>=0.45),
-    candidate is bumped to tier 2 (Potential Fit zone).
-    This handles cases where XGBoost mis-classifies a relevant candidate.
+    1 = Good Fit
+    2 = Potential Fit
+    3 = No Fit
     """
-    if label == 'Good Fit':
+
+    if label == "Good Fit":
         return 1
-    if label == 'Potential Fit':
+
+    if label == "Potential Fit":
         return 2
-    # No Fit — override if similarity is actually high
-    if final_score is not None and final_score >= 0.45:
+
+    if (
+        final_score is not None
+        and final_score >= 0.45
+    ):
         return 2
+
     return 3
 
 
-# ──────────────────────────────────────────────────
-# 5. RANK CANDIDATES FROM DATAFRAME
-# ──────────────────────────────────────────────────
+# ============================================================
+# 7. RANK LIVE UPLOADED RESUMES
+# ============================================================
 
-def rank_candidates_from_df(model, le, X_test, df_test):
+def rank_live_candidates(
+    resumes,
+    jd_text,
+    model,
+    le,
+    tfidf,
+    bert_model,
+    preprocess_fn,
+    explainer=None,
+    explain_fn=None,
+    skill_gap_fn=None
+):
     """
-    Rank all candidates in test set.
-    Returns sorted DataFrame with rank column.
+    Rank uploaded resumes against a job description.
+
+    The combined model expects EXACTLY 10,769 features:
+
+    10,000 TF-IDF
+    + 384 Resume BERT
+    + 384 JD BERT
+    + 1 BERT cosine similarity
+    --------------------------------
+    = 10,769 features
+
+    TF-IDF cosine similarity is calculated separately
+    for the final ranking score, but is NOT passed
+    into the XGBoost model.
     """
-    labels, confidence = predict_candidates(model, le, X_test)
 
-    df_ranking = df_test.copy()
-    df_ranking['predicted_label'] = labels
-    df_ranking['confidence']      = confidence
+    # --------------------------------------------------------
+    # Clean JD
+    # --------------------------------------------------------
 
-    df_ranking['final_score'] = df_ranking.apply(
-        lambda row: compute_final_score(
-            row['confidence'],
-            row['bert_similarity'],
-            row['cosine_similarity'],
-            row['predicted_label']
-        ), axis=1
+    jd_clean = preprocess_fn(
+        jd_text
     )
 
-    df_ranking['tier'] = df_ranking.apply(
-        lambda row: assign_tier(
-            row['predicted_label'],
-            row['final_score']
-        ), axis=1
-    )
+    results = []
 
-    # Sort purely by final_score — tier is display only
-    df_ranking = df_ranking.sort_values(
-        'final_score',
-        ascending=False
-    ).reset_index(drop=True)
-
-    df_ranking['rank'] = df_ranking.index + 1
-
-    return df_ranking
-
-
-# ──────────────────────────────────────────────────
-# 6. RANK LIVE UPLOADED RESUMES (for Streamlit)
-# ──────────────────────────────────────────────────
-
-def rank_live_candidates(resumes, jd_text,
-                          model, le, tfidf, bert_model,
-                          preprocess_fn):
-    """
-    Rank a list of live uploaded resumes against a JD.
-
-    Parameters:
-        resumes      : list of dicts with 'name' and 'text'
-        jd_text      : raw JD string
-        model        : trained best model
-        le           : label encoder
-        tfidf        : fitted TF-IDF vectorizer
-        bert_model   : loaded Sentence-BERT model
-        preprocess_fn: function to clean raw text
-
-    Returns: sorted DataFrame with ranking results
-    """
-    jd_clean = preprocess_fn(jd_text)
-    results  = []
+    # ========================================================
+    # PROCESS EACH RESUME
+    # ========================================================
 
     for resume in resumes:
-        name         = resume['name']
-        resume_clean = preprocess_fn(resume['text'])
 
-        # TF-IDF features
-        r_vec      = tfidf.transform([resume_clean])
-        j_vec      = tfidf.transform([jd_clean])
-        cosine_sim = float(cosine_similarity(r_vec, j_vec)[0][0])
-        sim_sparse = sp.csr_matrix([[cosine_sim]])
-        X_tfidf    = sp.hstack([r_vec, j_vec, sim_sparse])
+        name = resume["name"]
 
-        # BERT features
-        r_emb     = bert_model.encode([resume_clean])
-        j_emb     = bert_model.encode([jd_clean])
-        bert_sim  = float(cosine_similarity(r_emb, j_emb)[0][0])
-
-        # Combine TF-IDF + BERT
-        bert_vec = sp.csr_matrix(
-            np.hstack([r_emb, j_emb,
-                       np.array([[bert_sim]])])
+        resume_clean = preprocess_fn(
+            resume["text"]
         )
-        X_combined = sp.hstack([X_tfidf, bert_vec])
 
-        # Predict
-        y_pred     = model.predict(X_combined)
-        proba      = model.predict_proba(X_combined)
-        label      = le.inverse_transform(y_pred)[0]
-        confidence = float(proba.max())
+        # ----------------------------------------------------
+        # TF-IDF
+        # ----------------------------------------------------
 
-        # Override label if similarity scores contradict XGBoost
-        label = fix_predicted_label(label, bert_sim, cosine_sim)
+        resume_vec = tfidf.transform(
+            [resume_clean]
+        )
 
-        # Final score — label passed so No Fit confidence is not rewarded
+        jd_vec = tfidf.transform(
+            [jd_clean]
+        )
+
+        # TF-IDF cosine similarity
+        # Used for ranking score only
+        cosine_sim = float(
+            cosine_similarity(
+                resume_vec,
+                jd_vec
+            )[0][0]
+        )
+
+        # IMPORTANT:
+        # DO NOT add cosine_sim to X_tfidf.
+        #
+        # The combined XGBoost model was trained with:
+        # 5000 resume TF-IDF + 5000 JD TF-IDF
+        # = 10000 TF-IDF features
+        #
+        # Adding cosine here would make 10001 TF-IDF
+        # features and cause a shape mismatch.
+
+        X_tfidf = sp.hstack(
+            [
+                resume_vec,
+                jd_vec
+            ]
+        )
+
+        # ----------------------------------------------------
+        # BERT / Sentence-BERT
+        # ----------------------------------------------------
+
+        resume_emb = bert_model.encode(
+            [resume_clean]
+        )
+
+        jd_emb = bert_model.encode(
+            [jd_clean]
+        )
+
+        # BERT cosine similarity
+        bert_sim = float(
+            cosine_similarity(
+                resume_emb,
+                jd_emb
+            )[0][0]
+        )
+
+        # ----------------------------------------------------
+        # Combine BERT features
+        # ----------------------------------------------------
+
+        bert_features = sp.csr_matrix(
+            np.hstack(
+                [
+                    resume_emb,
+                    jd_emb,
+                    np.array(
+                        [[bert_sim]]
+                    )
+                ]
+            )
+        )
+
+        # ----------------------------------------------------
+        # FINAL MODEL INPUT
+        # ----------------------------------------------------
+
+        # 10,000 TF-IDF
+        # + 384 Resume BERT
+        # + 384 JD BERT
+        # + 1 BERT similarity
+        # = 10,769 features
+
+        X_combined = sp.hstack(
+            [
+                X_tfidf,
+                bert_features
+            ]
+        ).tocsr()
+
+        # ----------------------------------------------------
+        # XGBOOST PREDICTION
+        # ----------------------------------------------------
+
+        y_pred = model.predict(
+            X_combined
+        )
+
+        probabilities = model.predict_proba(
+            X_combined
+        )
+
+        raw_label = le.inverse_transform(
+            y_pred
+        )[0]
+
+        confidence = float(
+            probabilities.max()
+        )
+
+        label = fix_predicted_label(
+            raw_label,
+            bert_sim,
+            cosine_sim
+        )
+
+        # ----------------------------------------------------
+        # FINAL RANKING SCORE
+        # ----------------------------------------------------
+
         final_score = compute_final_score(
-            confidence, bert_sim, cosine_sim, label)
+            confidence,
+            bert_sim,
+            cosine_sim,
+            label
+        )
 
-        results.append({
-            'candidate':         name,
-            'predicted_label':   label,
-            'confidence':        round(confidence * 100, 1),
-            'bert_similarity':   round(bert_sim, 4),
-            'cosine_similarity': round(cosine_sim, 4),
-            'final_score':       round(final_score, 4),
-            'tier':              assign_tier(label, final_score)
-        })
+        # ----------------------------------------------------
+        # EXPLAINABILITY
+        # ----------------------------------------------------
 
-    # Sort purely by final_score — tier is display hint only
-    df_results = pd.DataFrame(results)
-    df_results = df_results.sort_values(
-        'final_score',
-        ascending=False
-    ).reset_index(drop=True)
+        resume_raw = resume["text"]
 
-    df_results['rank'] = df_results.index + 1
+        if explain_fn is not None:
+            try:
+                explanation = explain_fn(
+                    explainer,
+                    model,
+                    le,
+                    tfidf,
+                    resume_vec,
+                    jd_vec,
+                    X_combined.toarray()[0],
+                    raw_label,
+                    label,
+                    confidence,
+                    bert_sim,
+                    cosine_sim,
+                    resume_text_raw=resume_raw,
+                    jd_text_raw=jd_text
+                )
+
+            except Exception:
+                explanation = {
+                    "score_explanation": {},
+                    "keyword_explanation": [],
+                    "semantic_note": {},
+                    "model_diagnostic": {},
+                    "skill_gap": None
+                }
+
+        else:
+            explanation = None
+
+        # ----------------------------------------------------
+        # SKILL GAP
+        # ----------------------------------------------------
+
+        if skill_gap_fn is not None:
+            try:
+                skill_gap = skill_gap_fn(
+                    jd_text,
+                    resume_raw,
+                    bert_model
+                )
+
+            except Exception:
+                skill_gap = None
+
+        else:
+            skill_gap = None
+
+        # Add skill gap to explanation
+        if explanation is not None:
+            explanation["skill_gap"] = skill_gap
+
+        # ----------------------------------------------------
+        # SAVE RESULT
+        # ----------------------------------------------------
+
+        result_row = {
+            "candidate": name,
+
+            "predicted_label": label,
+
+            "confidence":
+                round(
+                    confidence * 100,
+                    1
+                ),
+
+            "bert_similarity":
+                round(
+                    bert_sim,
+                    4
+                ),
+
+            "cosine_similarity":
+                round(
+                    cosine_sim,
+                    4
+                ),
+
+            "final_score":
+                round(
+                    final_score,
+                    4
+                ),
+
+            "tier":
+                assign_tier(
+                    label,
+                    final_score
+                ),
+
+            "explanation": explanation,
+
+            "skill_gap": skill_gap
+        }
+
+        results.append(
+            result_row
+        )
+
+    # ========================================================
+    # SORT RESULTS
+    # ========================================================
+
+    df_results = pd.DataFrame(
+        results
+    )
+
+    if not df_results.empty:
+
+        df_results = (
+            df_results
+            .sort_values(
+                "final_score",
+                ascending=False
+            )
+            .reset_index(drop=True)
+        )
+
+        df_results["rank"] = (
+            df_results.index + 1
+        )
+
     return df_results
 
 
-# ──────────────────────────────────────────────────
-# 7. DISPLAY HELPERS
-# ──────────────────────────────────────────────────
+# ============================================================
+# 8. DISPLAY HELPERS
+# ============================================================
 
-def get_top_candidates(df_ranking, n=10):
-    """Return top N candidates."""
-    cols = ['rank', 'predicted_label', 'confidence',
-            'cosine_similarity', 'bert_similarity', 'final_score']
-    available = [c for c in cols if c in df_ranking.columns]
-    return df_ranking[available].head(n)
+def get_top_candidates(
+    df_ranking,
+    n=10
+):
+    """
+    Return top N candidates.
+    """
+
+    cols = [
+        "rank",
+        "candidate",
+        "predicted_label",
+        "confidence",
+        "cosine_similarity",
+        "bert_similarity",
+        "final_score"
+    ]
+
+    available = [
+        c
+        for c in cols
+        if c in df_ranking.columns
+    ]
+
+    return (
+        df_ranking[
+            available
+        ]
+        .head(n)
+    )
 
 
 def get_label_emoji(label):
-    """Return emoji for each label."""
+    """
+    Return emoji for each label.
+    """
+
     emojis = {
-        'Good Fit':      '🟢',
-        'Potential Fit': '🟡',
-        'No Fit':        '🔴'
+        "Good Fit": "🟢",
+        "Potential Fit": "🟡",
+        "No Fit": "🔴"
     }
-    return emojis.get(label, '⚪')
+
+    return emojis.get(
+        label,
+        "⚪"
+    )
 
 
-# ──────────────────────────────────────────────────
-# 8. MAIN
-# ──────────────────────────────────────────────────
+# ============================================================
+# 9. MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    best_model, le, tfidf, X_test, df_test = \
+
+    model, le, tfidf, bert_model = (
         load_ranking_components()
+    )
 
-    df_ranking = rank_candidates_from_df(
-        best_model, le, X_test, df_test)
+    print(
+        "\nEnhanced ranking components "
+        "loaded successfully."
+    )
 
-    print("\n=== TOP 10 CANDIDATES ===")
-    print(get_top_candidates(df_ranking))
-
-    print("\n=== BOTTOM 10 CANDIDATES ===")
-    print(get_top_candidates(
-        df_ranking.sort_values('rank', ascending=False)))
